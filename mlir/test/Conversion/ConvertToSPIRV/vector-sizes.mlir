@@ -51,7 +51,7 @@ func.func @vec_size_5(%arg0: vector<5xf32>) -> (f32) {
 
   // CHECK-NEXT: %[[VAL:.+]] = vector.extract_strided_slice %[[ARG0]] {offsets = [0], sizes = [1], strides = [1]} : vector<5xf32> to vector<1xf32>
 
-  // We have the following comment in VectorConvertToElementOp
+  // We have the following comment in VectorToElementOpConvert
   //
   // // Input vectors of size 1 are converted to scalars by the type converter.
   // // We cannot use `spirv::CompositeExtractOp` directly in this case.
@@ -64,4 +64,42 @@ func.func @vec_size_5(%arg0: vector<5xf32>) -> (f32) {
 
   // CHECK-NEXT: spirv.ReturnValue %[[RETVAL]] : f32
   return %0#0 : f32
+}
+
+// -----
+
+// Similar to how parameters' types get changed even if
+// run-signature-conversion=false, the return type will
+// be changed to a scalar.
+
+// CHECK-LABEL: @vec_size_1
+// CHECK-SAME: (%[[ARG0:.+]]: f32) -> (f32)
+func.func @vec_size_1(%arg0: f32) -> (vector<1xf32>) {
+  // spirv.ReturnValue %[[ARG0]]: f32
+  %0 = vector.from_elements %arg0 : vector<1xf32>
+  return %0 : vector<1xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @vec_size_2
+// CHECK-SAME: (%[[ARG0.+]]: f32)
+func.func @vec_size_2(%arg0: f32) -> (vector<2xf32>) {
+  // CHECK: %[[RETVAL.+]] = spirv.CompositeConstruct %[[ARG0]], %[[ARG0]]: (f32, f32) -> vector<2xf32>
+  %0 = vector.from_elements %arg0, %arg0 : vector<2xf32>
+  // CHECK: spirv.ReturnValue %[[RETVAL]] : vector<2xf32>
+  return %0 : vector<2xf32>
+}
+
+// -----
+
+// Here, due to the constraints of SPIR-V
+// we are returning only a subset of the from_elements vector.
+
+// CHECK-LABEL: @vec_size_5
+// CHECK-SAME: (%[[ARG0.+]]: f32)
+func.func @vec_size_5(%arg0: f32) -> (vector<3xf32>) {
+  %0 = vector.from_elements %arg0, %arg0, %arg0, %arg0, %arg0 : vector<5xf32>
+  %1 = vector.extract_strided_slice %0 {offsets = [2], sizes = [3], strides = [1]} : vector<5xf32> to vector<3xf32>
+  return %1 : vector<3xf32>
 }

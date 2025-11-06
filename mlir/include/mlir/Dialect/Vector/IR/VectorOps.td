@@ -820,6 +820,7 @@ def Vector_ToElementsOp : Vector_Op<"to_elements", [
 
 def Vector_FromElementsOp : Vector_Op<"from_elements", [
     Pure,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface>,
     ShapedTypeMatchesElementCountAndTypes<"dest", "elements">]> {
   let summary = "operation that defines a vector from scalar elements";
   let description = [{

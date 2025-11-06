@@ -1445,6 +1445,14 @@ mlir::spirv::getNativeVectorShapeImpl(vector::ToElementsOp op) {
 }
 
 SmallVector<int64_t>
+mlir::spirv::getNativeVectorShapeImpl(vector::FromElementsOp op) {
+  VectorType type = cast<VectorType>(op.getResult().getType());
+  assert(type.getRank() == 1); // Guaranteed by UnrollFromElements
+  int64_t vectorSize = mlir::spirv::getComputeVectorSize(type.getDimSize(0));
+  return {vectorSize};
+}
+
+SmallVector<int64_t>
 mlir::spirv::getNativeVectorShapeImpl(vector::ReductionOp op) {
   VectorType srcVectorType = op.getSourceVectorType();
   assert(srcVectorType.getRank() == 1); // Guaranteed by semantics
@@ -1474,7 +1482,8 @@ mlir::spirv::getNativeVectorShape(Operation *op) {
   }
 
   return TypeSwitch<Operation *, std::optional<SmallVector<int64_t>>>(op)
-      .Case<vector::ReductionOp, vector::TransposeOp, vector::ToElementsOp>(
+      .Case<vector::ReductionOp, vector::TransposeOp, vector::ToElementsOp,
+            vector::FromElementsOp>(
           [](auto typedOp) { return getNativeVectorShapeImpl(typedOp); })
       .Default(std::nullopt);
 }

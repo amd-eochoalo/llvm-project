@@ -1058,6 +1058,78 @@ private:
   vector::UnrollVectorOptions options;
 };
 
+/// Takes a 1 dimensional `vector.from_element` op and attempts to change it to
+/// the target shape.
+///
+/// ```
+/// // Target shape is {2}
+/// %v = vector.from_elements %s0, %s1, %s2, %s3 : vector<4xf32>
+///
+/// ===>
+///
+/// %v0 = vector.from_elements %s0, %s1 : vector<2xf32>
+/// %v1 = vector.from_elements %s2, %s3 : vector<2xf32>
+/// %result = arith.constant dense<0.000000e+00> : vector<4xf32>
+/// %result0 = vector.insert_strided_slice %v0, %result
+///     {offsets = [0], strides = [1]} : vector<2xf32> into vector<4xf32>
+/// %result1 = vector.insert_strided_slice %v0, %result
+///     {offsets = [2], strides = [1]} : vector<2xf32> into vector<4xf32>
+/// ```
+///
+/// This pattern may fail if the rank is not divisible by to a native shape
+/// or if the rank is already in the target shape and therefore it may be
+/// skipped.
+struct FromElementsToTargetShape final
+    : public OpRewritePattern<vector::FromElementsOp> {
+  FromElementsToTargetShape(MLIRContext *context,
+                            const vector::UnrollVectorOptions &options,
+                            PatternBenefit benefit = 1)
+      : OpRewritePattern<vector::FromElementsOp>(context, benefit),
+        options(options) {}
+
+  LogicalResult matchAndRewrite(vector::FromElementsOp op,
+                                PatternRewriter &rewriter) const override {
+    auto targetShape = getTargetShape(options, op);
+    if (!targetShape)
+      return failure();
+
+    // We have
+    // source_rank = N * target_rank
+    auto vecType = cast<VectorType>(op.getResult().getType());
+    int64_t source_rank = vecType.getShape().front();
+    int64_t target_rank = targetShape->front();
+    op.emitRemark() << target_rank;
+    int64_t N = source_rank / target_rank;
+
+    auto targetVecType =
+        VectorType::get(*targetShape, vecType.getElementType());
+    SmallVector<vector::FromElementsOp> fromElementsOpSequence;
+    for (int i = 0; i < N; i++) {
+      // Pick the { i*target_rank, i*target_rank + 1, ... i*2*target_rank - 1 }
+      // operands out of vector.from_elements
+      ValueRange elements = op.getElements();
+      SmallVector<Value> chunk = elements.slice(i * target_rank, target_rank);
+      vector::FromElementsOp fromElementsOp = vector::FromElementsOp::create(rewriter, op.getLoc(), targetVecType, chunk);
+      fromElementsOpSequence.push_back(fromElementsOp);
+    }
+
+    Value result =
+        arith::ConstantOp::create(rewriter, op.getLoc(), vecType,
+                                  rewriter.getZeroAttr(vecType));
+
+    SmallVector<int64_t> strides(targetShape->size(), 1);
+    for (const auto &fromElementsOp : llvm::enumerate(fromElementsOpSequence)) {
+      result = rewriter.createOrFold<vector::InsertStridedSliceOp>(
+          op.getLoc(), fromElementsOp.value(), result, fromElementsOp.index() * target_rank, strides);
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  vector::UnrollVectorOptions options;
+};
+
 /// Unrolls 2 or more dimensional `vector.from_elements` ops by unrolling the
 /// outermost dimension. For example:
 /// ```
@@ -1113,8 +1185,9 @@ void mlir::vector::populateVectorUnrollPatterns(
                UnrollReductionPattern, UnrollMultiReductionPattern,
                UnrollTransposePattern, UnrollGatherPattern, UnrollLoadPattern,
                UnrollStorePattern, UnrollBroadcastPattern, UnrollFromElements,
-               UnrollToElements, UnrollStepPattern, ToElementsToTargetShape>(
-      patterns.getContext(), options, benefit);
+               UnrollToElements, UnrollStepPattern, ToElementsToTargetShape,
+               FromElementsToTargetShape>(patterns.getContext(), options,
+                                          benefit);
 }
 
 void mlir::vector::populateVectorToElementsUnrollPatterns(
@@ -1126,6 +1199,7 @@ void mlir::vector::populateVectorToElementsUnrollPatterns(
 
 void mlir::vector::populateVectorFromElementsUnrollPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<UnrollFromElements>(patterns.getContext(), UnrollVectorOptions(),
-                                   benefit);
+  auto options = UnrollVectorOptions().setNativeShape(SmallVector<int64_t>{4});
+  patterns.add<UnrollFromElements, FromElementsToTargetShape>(
+      patterns.getContext(), options, benefit);
 }

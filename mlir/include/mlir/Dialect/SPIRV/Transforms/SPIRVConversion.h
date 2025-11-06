@@ -201,6 +201,9 @@ int getComputeVectorSize(int64_t size);
 // GetNativeVectorShape implementation for to_elements ops.
 SmallVector<int64_t> getNativeVectorShapeImpl(vector::ToElementsOp op);
 
+// GetNativeVectorShape implementation for from_elements ops.
+SmallVector<int64_t> getNativeVectorShapeImpl(vector::FromElementsOp op);
+
 // GetNativeVectorShape implementation for reduction ops.
 SmallVector<int64_t> getNativeVectorShapeImpl(vector::ReductionOp op);
 
