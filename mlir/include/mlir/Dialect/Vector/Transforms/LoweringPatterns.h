@@ -52,6 +52,23 @@ void populateVectorContractLoweringPatterns(
     VectorContractLowering vectorContractLoweringOption,
     PatternBenefit benefit = 1, bool disableOuterProductLowering = false);
 
+/// Collect a set of patterns to unroll vector.contract operations by
+/// progressively reducing the iteration space rank.
+///
+/// [UnrollContractAlongBatchDim]
+/// When the contract has a batch dimension (parallel iterator appearing in
+/// all three operands), unrolls along that dimension by extracting slices
+/// and creating smaller contracts.
+///
+/// Unlike the existing UnrollContractionPattern in VectorUnroll.cpp which
+/// uses extract_strided_slice with a target shape, these patterns use
+/// vector.extract to reduce rank by exactly 1 per application.
+///
+/// These patterns are designed to compose with the existing lowering
+/// patterns in populateVectorContractLoweringPatterns.
+void populateVectorUnrollContract(RewritePatternSet &patterns,
+                                  PatternBenefit benefit = 1);
+
 /// Populate the pattern set with the following patterns:
 ///
 /// [OuterProductOpLowering]

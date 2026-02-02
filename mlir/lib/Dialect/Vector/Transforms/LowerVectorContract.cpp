@@ -1229,6 +1229,11 @@ void mlir::vector::populateVectorContractLoweringPatterns(
       vectorContractLoweringOption, patterns.getContext(), benefit);
 }
 
+void mlir::vector::populateVectorUnrollContract(RewritePatternSet &patterns,
+                                                PatternBenefit benefit) {
+  // TODO: Add UnrollContractAlongBatchDim pattern.
+}
+
 void mlir::vector::populateVectorOuterProductLoweringPatterns(
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<OuterProductOpLowering>(patterns.getContext(), benefit);
