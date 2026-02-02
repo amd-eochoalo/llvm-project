@@ -1378,12 +1378,6 @@ struct UnrollContractAlongBatchDim
     for (int64_t i = 0; i < batchDimSize; ++i)
       result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
 
-    // Replace the original operation.
-    if (maskOp)
-      rewriter.replaceOp(maskOp, result);
-    else
-      rewriter.replaceOp(contractOp, result);
-
     return result;
   }
 };
