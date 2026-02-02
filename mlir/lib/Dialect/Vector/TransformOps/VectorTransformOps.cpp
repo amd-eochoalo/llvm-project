@@ -110,6 +110,11 @@ void transform::ApplyLowerContractionPatternsOp::populatePatterns(
                                          /*disableOuterProductLowering=*/true);
 }
 
+void transform::ApplyUnrollContractPatternsOp::populatePatterns(
+    RewritePatternSet &patterns) {
+  // TODO: Call vector::populateVectorUnrollContract(patterns) once implemented.
+}
+
 void transform::ApplyLowerMasksPatternsOp::populatePatterns(
     RewritePatternSet &patterns) {
   populateVectorMaskOpLoweringPatterns(patterns);
