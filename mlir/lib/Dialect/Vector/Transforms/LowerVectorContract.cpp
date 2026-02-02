@@ -1217,6 +1217,177 @@ public:
   }
 };
 
+//===----------------------------------------------------------------------===//
+// UnrollContractAlongBatchDim
+//===----------------------------------------------------------------------===//
+
+/// Creates a new affine map with the specified iterator removed.
+/// All iterator indices greater than the removed one are decremented.
+static AffineMap dropIteratorFromMap(AffineMap map, int64_t iterIdx,
+                                     MLIRContext *ctx) {
+  SmallVector<AffineExpr> newResults;
+  for (int64_t i = 0, e = map.getNumResults(); i < e; ++i) {
+    int64_t dimPos = map.getDimPosition(i);
+    if (dimPos == iterIdx)
+      continue;
+    // Decrement indices greater than the removed iterator.
+    int64_t newDimPos = dimPos > iterIdx ? dimPos - 1 : dimPos;
+    newResults.push_back(getAffineDimExpr(newDimPos, ctx));
+  }
+  return AffineMap::get(map.getNumDims() - 1, 0, newResults, ctx);
+}
+
+/// Creates new iterator types with the specified iterator removed.
+static SmallVector<Attribute> dropIteratorType(ArrayAttr iteratorTypes,
+                                               int64_t iterIdx) {
+  SmallVector<Attribute> result;
+  for (int64_t i = 0, e = iteratorTypes.size(); i < e; ++i) {
+    if (i != iterIdx)
+      result.push_back(iteratorTypes[i]);
+  }
+  return result;
+}
+
+/// Unrolls vector.contract along a batch dimension.
+///
+/// A batch dimension is a parallel iterator that appears in all three
+/// operands (lhs, rhs, acc) at their outermost position. This pattern
+/// extracts slices along the batch dimension, creates smaller contracts,
+/// and assembles the results.
+///
+/// Example:
+/// ```mlir
+/// // Before (batch dim b at position 0):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(b, m, n, k) -> (b, m, k)>,
+///         affine_map<(b, m, n, k) -> (b, k, n)>,
+///         affine_map<(b, m, n, k) -> (b, m, n)>
+///     ],
+///     iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+/// } %A, %B, %C : vector<2x4x3xf32>, vector<2x3x5xf32> into vector<2x4x5xf32>
+///
+/// // After:
+/// %a0 = vector.extract %A[0] : vector<4x3xf32> from vector<2x4x3xf32>
+/// %b0 = vector.extract %B[0] : vector<3x5xf32> from vector<2x3x5xf32>
+/// %c0 = vector.extract %C[0] : vector<4x5xf32> from vector<2x4x5xf32>
+/// %r0 = vector.contract { ... } %a0, %b0, %c0 : ... into vector<4x5xf32>
+/// // ... repeat for index 1 ...
+/// %result = vector.insert %r1, (vector.insert %r0, %init[0])[1]
+/// ```
+struct UnrollContractAlongBatchDim
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    // Need at least 2 iterators to unroll one away.
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.size() < 2)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "need at least 2 iterators");
+
+    // Find the first batch dimension (parallel iterator in all operands).
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    std::optional<int64_t> batchIterIdx;
+    int64_t batchDimSize = -1;
+
+    for (int64_t i = 0, e = iteratorTypes.size(); i < e; ++i) {
+      if (!isParallelIterator(iteratorTypes[i]))
+        continue;
+
+      // Check if this iterator appears in all three maps at position 0.
+      // Reuse existing getResultIndex helper which finds iterator position.
+      std::optional<int64_t> lhsPos = getResultIndex(maps[0], i);
+      std::optional<int64_t> rhsPos = getResultIndex(maps[1], i);
+      std::optional<int64_t> accPos = getResultIndex(maps[2], i);
+
+      if (!lhsPos || !rhsPos || !accPos)
+        continue;
+
+      // For simplicity, require the batch dim to be outermost in all operands.
+      if (*lhsPos != 0 || *rhsPos != 0 || *accPos != 0)
+        continue;
+
+      // Found a batch dimension at the outermost position.
+      batchIterIdx = i;
+      batchDimSize = contractOp.getLhsType().getDimSize(0);
+      break;
+    }
+
+    if (!batchIterIdx)
+      return rewriter.notifyMatchFailure(
+          contractOp, "no batch dimension at outermost position");
+
+    Location loc = contractOp.getLoc();
+    Value lhs = contractOp.getLhs();
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    // Handle masking.
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    // Create new indexing maps with the batch iterator removed.
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineMap> newMaps;
+    for (AffineMap map : maps)
+      newMaps.push_back(dropIteratorFromMap(map, *batchIterIdx, ctx));
+
+    // Create new iterator types with the batch iterator removed.
+    SmallVector<Attribute> newIterTypes =
+        dropIteratorType(iteratorTypes, *batchIterIdx);
+
+    // Extract slices and compute smaller contracts.
+    SmallVector<Value> lhsSlices, rhsSlices, accSlices, maskSlices;
+    for (int64_t i = 0; i < batchDimSize; ++i) {
+      lhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, lhs, i));
+      rhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, rhs, i));
+      accSlices.push_back(vector::ExtractOp::create(rewriter, loc, acc, i));
+      if (mask)
+        maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
+    }
+
+    // Create smaller contracts.
+    SmallVector<Value> results;
+    ArrayAttr newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
+    ArrayAttr newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
+
+    for (int64_t i = 0; i < batchDimSize; ++i) {
+      vector::ContractionOp newContract = vector::ContractionOp::create(
+          rewriter, loc, lhsSlices[i], rhsSlices[i], accSlices[i], newMapsAttr,
+          newIterTypesAttr, contractOp.getKind());
+
+      if (mask) {
+        Operation *maskedOp =
+            mlir::vector::maskOperation(rewriter, newContract, maskSlices[i]);
+        results.push_back(maskedOp->getResult(0));
+      } else {
+        results.push_back(newContract.getResult());
+      }
+    }
+
+    // Assemble results.
+    auto resultType = cast<VectorType>(contractOp.getResultType());
+    Value result = arith::ConstantOp::create(rewriter, loc, resultType,
+                                             rewriter.getZeroAttr(resultType));
+
+    for (int64_t i = 0; i < batchDimSize; ++i)
+      result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
+
+    // Replace the original operation.
+    if (maskOp)
+      rewriter.replaceOp(maskOp, result);
+    else
+      rewriter.replaceOp(contractOp, result);
+
+    return result;
+  }
+};
+
 } // namespace
 
 void mlir::vector::populateVectorContractLoweringPatterns(
@@ -1231,7 +1402,7 @@ void mlir::vector::populateVectorContractLoweringPatterns(
 
 void mlir::vector::populateVectorUnrollContract(RewritePatternSet &patterns,
                                                 PatternBenefit benefit) {
-  // TODO: Add UnrollContractAlongBatchDim pattern.
+  patterns.add<UnrollContractAlongBatchDim>(patterns.getContext(), benefit);
 }
 
 void mlir::vector::populateVectorOuterProductLoweringPatterns(

@@ -112,7 +112,7 @@ void transform::ApplyLowerContractionPatternsOp::populatePatterns(
 
 void transform::ApplyUnrollContractPatternsOp::populatePatterns(
     RewritePatternSet &patterns) {
-  // TODO: Call vector::populateVectorUnrollContract(patterns) once implemented.
+  vector::populateVectorUnrollContract(patterns);
 }
 
 void transform::ApplyLowerMasksPatternsOp::populatePatterns(
