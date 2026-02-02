@@ -167,6 +167,23 @@ def ApplyLowerContractionPatternsOp : Op<Transform_Dialect,
   }];
 }
 
+def ApplyUnrollContractPatternsOp : Op<Transform_Dialect,
+    "apply_patterns.vector.unroll_contract",
+    [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let description = [{
+    Populates patterns that unroll vector.contract operations by
+    progressively reducing the iteration space rank. Unrolls along
+    parallel dimensions (batch, then free) before reduction dimensions.
+
+    These patterns complement the existing `lower_contraction` patterns
+    by providing an alternative lowering path that uses `vector.extract`
+    and `vector.insert` instead of `extract_strided_slice` and
+    `insert_strided_slice`.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def ApplyLowerCreateMaskPatternsOp : Op<Transform_Dialect,
     "apply_patterns.vector.lower_create_mask",
     [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {

@@ -1217,6 +1217,610 @@ public:
   }
 };
 
+//===----------------------------------------------------------------------===//
+// UnrollContractAlongBatchDim
+//===----------------------------------------------------------------------===//
+
+/// Creates a new affine map with the specified iterator removed.
+/// All iterator indices greater than the removed one are decremented.
+static AffineMap dropIteratorFromMap(AffineMap map, int64_t iterIdx,
+                                     MLIRContext *ctx) {
+  SmallVector<AffineExpr> newResults;
+  for (int64_t i = 0, e = map.getNumResults(); i < e; ++i) {
+    int64_t dimPos = map.getDimPosition(i);
+    if (dimPos == iterIdx)
+      continue;
+    // Decrement indices greater than the removed iterator.
+    int64_t newDimPos = dimPos > iterIdx ? dimPos - 1 : dimPos;
+    newResults.push_back(getAffineDimExpr(newDimPos, ctx));
+  }
+  return AffineMap::get(map.getNumDims() - 1, 0, newResults, ctx);
+}
+
+/// Creates new iterator types with the specified iterator removed.
+static SmallVector<Attribute> dropIteratorType(ArrayAttr iteratorTypes,
+                                               int64_t iterIdx) {
+  SmallVector<Attribute> result;
+  for (int64_t i = 0, e = iteratorTypes.size(); i < e; ++i) {
+    if (i != iterIdx)
+      result.push_back(iteratorTypes[i]);
+  }
+  return result;
+}
+
+/// Unrolls vector.contract along a batch dimension.
+///
+/// A batch dimension is a parallel iterator that appears in all three
+/// operands (lhs, rhs, acc) at their outermost position. This pattern
+/// extracts slices along the batch dimension, creates smaller contracts,
+/// and assembles the results.
+///
+/// Example:
+/// ```mlir
+/// // Before (batch dim b at position 0):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(b, m, n, k) -> (b, m, k)>,
+///         affine_map<(b, m, n, k) -> (b, k, n)>,
+///         affine_map<(b, m, n, k) -> (b, m, n)>
+///     ],
+///     iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+/// } %A, %B, %C : vector<2x4x3xf32>, vector<2x3x5xf32> into vector<2x4x5xf32>
+///
+/// // After:
+/// %a0 = vector.extract %A[0] : vector<4x3xf32> from vector<2x4x3xf32>
+/// %b0 = vector.extract %B[0] : vector<3x5xf32> from vector<2x3x5xf32>
+/// %c0 = vector.extract %C[0] : vector<4x5xf32> from vector<2x4x5xf32>
+/// %r0 = vector.contract { ... } %a0, %b0, %c0 : ... into vector<4x5xf32>
+/// // ... repeat for index 1 ...
+/// %result = vector.insert %r1, (vector.insert %r0, %init[0])[1]
+/// ```
+struct UnrollContractAlongBatchDim
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.size() < 2)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "need at least 2 iterators");
+
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (maps[0].getNumResults() == 0 || maps[1].getNumResults() == 0 ||
+        maps[2].getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
+
+    int64_t lhsIter = maps[0].getDimPosition(0);
+    int64_t rhsIter = maps[1].getDimPosition(0);
+    int64_t accIter = maps[2].getDimPosition(0);
+
+    if (lhsIter != rhsIter)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "LHS and RHS have different iterators at outermost position");
+    if (rhsIter != accIter)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "RHS and ACC have different iterators at outermost position");
+
+    int64_t batchIterIdx = lhsIter;
+    if (!isParallelIterator(iteratorTypes[batchIterIdx]))
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost iterator is not parallel (not a batch dimension)");
+
+    int64_t batchDimSize = contractOp.getLhsType().getDimSize(0);
+
+    Location loc = contractOp.getLoc();
+    Value lhs = contractOp.getLhs();
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineMap> newMaps;
+    for (AffineMap map : maps)
+      newMaps.push_back(dropIteratorFromMap(map, batchIterIdx, ctx));
+
+    SmallVector<Attribute> newIterTypes =
+        dropIteratorType(iteratorTypes, batchIterIdx);
+
+    SmallVector<Value> lhsSlices, rhsSlices, accSlices, maskSlices;
+    for (int64_t i = 0; i < batchDimSize; ++i) {
+      lhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, lhs, i));
+      rhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, rhs, i));
+      accSlices.push_back(vector::ExtractOp::create(rewriter, loc, acc, i));
+      if (mask)
+        maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
+    }
+
+    SmallVector<Value> results;
+    ArrayAttr newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
+    ArrayAttr newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
+
+    for (int64_t i = 0; i < batchDimSize; ++i) {
+      vector::ContractionOp newContract = vector::ContractionOp::create(
+          rewriter, loc, lhsSlices[i], rhsSlices[i], accSlices[i], newMapsAttr,
+          newIterTypesAttr, contractOp.getKind());
+
+      if (mask) {
+        Operation *maskedOp =
+            mlir::vector::maskOperation(rewriter, newContract, maskSlices[i]);
+        results.push_back(maskedOp->getResult(0));
+      } else {
+        results.push_back(newContract.getResult());
+      }
+    }
+
+    auto resultType = cast<VectorType>(contractOp.getResultType());
+    Value result = arith::ConstantOp::create(rewriter, loc, resultType,
+                                             rewriter.getZeroAttr(resultType));
+
+    for (int64_t i = 0; i < batchDimSize; ++i)
+      result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
+
+    return result;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// UnrollContractAlongLhsFreeDim
+//===----------------------------------------------------------------------===//
+
+/// Unrolls vector.contract along a free LHS dimension.
+///
+/// A free LHS dimension is a parallel iterator that appears in the LHS
+/// and accumulator/result, but NOT in the RHS. This pattern extracts
+/// slices along the free dimension from LHS and ACC, while reusing RHS
+/// (which is broadcast semantically across this dimension).
+///
+/// Example:
+/// ```mlir
+/// // Before (free LHS dim 'm' at iterator position 0):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(m, n, k) -> (m, k)>,  // LHS: 4x8
+///         affine_map<(m, n, k) -> (k, n)>,  // RHS: 8x6 (no m)
+///         affine_map<(m, n, k) -> (m, n)>   // ACC: 4x6
+///     ],
+///     iterator_types = ["parallel", "parallel", "reduction"]
+/// } %A, %B, %C : vector<4x8xf32>, vector<8x6xf32> into vector<4x6xf32>
+///
+/// // After:
+/// %a0 = vector.extract %A[0] : vector<8xf32> from vector<4x8xf32>
+/// %c0 = vector.extract %C[0] : vector<6xf32> from vector<4x6xf32>
+/// // Note: B is NOT extracted - reused for all iterations
+/// %r0 = vector.contract {
+///     indexing_maps = [
+///         affine_map<(n, k) -> (k)>,
+///         affine_map<(n, k) -> (k, n)>,
+///         affine_map<(n, k) -> (n)>
+///     ],
+///     iterator_types = ["parallel", "reduction"]
+/// } %a0, %B, %c0 : vector<8xf32>, vector<8x6xf32> into vector<6xf32>
+/// // ... repeat for m=1,2,3, then assemble results ...
+/// ```
+struct UnrollContractAlongLhsFreeDim
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.size() < 2)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "need at least 2 iterators");
+
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    AffineMap lhsMap = maps[0];
+    AffineMap rhsMap = maps[1];
+    AffineMap accMap = maps[2];
+
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (lhsMap.getNumResults() == 0 || rhsMap.getNumResults() == 0 ||
+        accMap.getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
+
+    int64_t lhsIter = lhsMap.getDimPosition(0);
+    int64_t accIter = accMap.getDimPosition(0);
+
+    if (lhsIter != accIter)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "LHS and ACC have different iterators at outermost position");
+
+    int64_t freeLhsIterIdx = lhsIter;
+    if (getResultIndex(rhsMap, freeLhsIterIdx).has_value())
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost LHS iterator also appears in RHS (not a free LHS dim)");
+
+    if (!isParallelIterator(iteratorTypes[freeLhsIterIdx]))
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost LHS iterator is not parallel (not a free dimension)");
+
+    int64_t freeLhsDimSize = contractOp.getLhsType().getDimSize(0);
+
+    Location loc = contractOp.getLoc();
+    Value lhs = contractOp.getLhs();
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineMap> newMaps;
+    for (AffineMap map : maps)
+      newMaps.push_back(dropIteratorFromMap(map, freeLhsIterIdx, ctx));
+
+    SmallVector<Attribute> newIterTypes =
+        dropIteratorType(iteratorTypes, freeLhsIterIdx);
+
+    SmallVector<Value> lhsSlices, accSlices, maskSlices;
+    for (int64_t i = 0; i < freeLhsDimSize; ++i) {
+      lhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, lhs, i));
+      accSlices.push_back(vector::ExtractOp::create(rewriter, loc, acc, i));
+      if (mask)
+        maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
+    }
+
+    // Create smaller contracts.
+    // Key: RHS is NOT sliced - it's reused for all iterations.
+    SmallVector<Value> results;
+    auto newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
+    auto newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
+
+    for (int64_t i = 0; i < freeLhsDimSize; ++i) {
+      auto newContract = vector::ContractionOp::create(
+          rewriter, loc, lhsSlices[i], rhs, accSlices[i], newMapsAttr,
+          newIterTypesAttr, contractOp.getKind());
+
+      if (mask) {
+        Operation *maskedOp =
+            mlir::vector::maskOperation(rewriter, newContract, maskSlices[i]);
+        results.push_back(maskedOp->getResult(0));
+      } else {
+        results.push_back(newContract.getResult());
+      }
+    }
+
+    auto resultType = cast<VectorType>(contractOp.getResultType());
+    Value result = arith::ConstantOp::create(rewriter, loc, resultType,
+                                             rewriter.getZeroAttr(resultType));
+
+    for (int64_t i = 0; i < freeLhsDimSize; ++i)
+      result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
+
+    return result;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// UnrollContractAlongRhsFreeDim
+//===----------------------------------------------------------------------===//
+
+/// Unrolls vector.contract along a free RHS dimension.
+///
+/// A free RHS dimension is a parallel iterator that appears in the RHS
+/// and accumulator/result, but NOT in the LHS. This pattern extracts
+/// slices along the free dimension from RHS and ACC, while reusing LHS
+/// (which is broadcast semantically across this dimension).
+///
+/// Example:
+/// ```mlir
+/// // Before (free RHS dim 'n' at iterator position 0):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(n, m, k) -> (m, k)>,  // LHS: 4x8 (no n)
+///         affine_map<(n, m, k) -> (n, k)>,  // RHS: 6x8
+///         affine_map<(n, m, k) -> (n, m)>   // ACC: 6x4
+///     ],
+///     iterator_types = ["parallel", "parallel", "reduction"]
+/// } %A, %B, %C : vector<4x8xf32>, vector<6x8xf32> into vector<6x4xf32>
+///
+/// // After:
+/// %b0 = vector.extract %B[0] : vector<8xf32> from vector<6x8xf32>
+/// %c0 = vector.extract %C[0] : vector<4xf32> from vector<6x4xf32>
+/// // Note: A is NOT extracted - reused for all iterations
+/// %r0 = vector.contract {
+///     indexing_maps = [
+///         affine_map<(m, k) -> (m, k)>,
+///         affine_map<(m, k) -> (k)>,
+///         affine_map<(m, k) -> (m)>
+///     ],
+///     iterator_types = ["parallel", "reduction"]
+/// } %A, %b0, %c0 : vector<4x8xf32>, vector<8xf32> into vector<4xf32>
+/// // ... repeat for n=1..5, then assemble results ...
+/// ```
+struct UnrollContractAlongRhsFreeDim
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.size() < 2)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "need at least 2 iterators");
+
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    AffineMap lhsMap = maps[0];
+    AffineMap rhsMap = maps[1];
+    AffineMap accMap = maps[2];
+
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (lhsMap.getNumResults() == 0 || rhsMap.getNumResults() == 0 ||
+        accMap.getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
+
+    int64_t rhsIter = rhsMap.getDimPosition(0);
+    int64_t accIter = accMap.getDimPosition(0);
+
+    if (rhsIter != accIter)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "RHS and ACC have different iterators at outermost position");
+
+    int64_t freeRhsIterIdx = rhsIter;
+    if (getResultIndex(lhsMap, freeRhsIterIdx).has_value())
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost RHS iterator also appears in LHS (not a free RHS dim)");
+
+    if (!isParallelIterator(iteratorTypes[freeRhsIterIdx]))
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost RHS iterator is not parallel (not a free dimension)");
+
+    int64_t freeRhsDimSize = contractOp.getRhsType().getDimSize(0);
+
+    Location loc = contractOp.getLoc();
+    Value lhs = contractOp.getLhs(); // Will be reused, not extracted
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineMap> newMaps;
+    for (AffineMap map : maps)
+      newMaps.push_back(dropIteratorFromMap(map, freeRhsIterIdx, ctx));
+
+    SmallVector<Attribute> newIterTypes =
+        dropIteratorType(iteratorTypes, freeRhsIterIdx);
+
+    SmallVector<Value> rhsSlices, accSlices, maskSlices;
+    for (int64_t i = 0; i < freeRhsDimSize; ++i) {
+      rhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, rhs, i));
+      accSlices.push_back(vector::ExtractOp::create(rewriter, loc, acc, i));
+      if (mask)
+        maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
+    }
+
+    // Create smaller contracts.
+    // Key: LHS is NOT sliced - it's reused for all iterations.
+    SmallVector<Value> results;
+    auto newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
+    auto newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
+
+    for (int64_t i = 0; i < freeRhsDimSize; ++i) {
+      auto newContract = vector::ContractionOp::create(
+          rewriter, loc, lhs, rhsSlices[i], accSlices[i], newMapsAttr,
+          newIterTypesAttr, contractOp.getKind());
+
+      if (mask) {
+        Operation *maskedOp =
+            mlir::vector::maskOperation(rewriter, newContract, maskSlices[i]);
+        results.push_back(maskedOp->getResult(0));
+      } else {
+        results.push_back(newContract.getResult());
+      }
+    }
+
+    auto resultType = cast<VectorType>(contractOp.getResultType());
+    Value result = arith::ConstantOp::create(rewriter, loc, resultType,
+                                             rewriter.getZeroAttr(resultType));
+
+    for (int64_t i = 0; i < freeRhsDimSize; ++i)
+      result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
+
+    return result;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// PureReductionContractToMultiReduction
+//===----------------------------------------------------------------------===//
+
+/// Lowers a pure-reduction vector.contract to arith.mulf +
+/// vector.multi_reduction.
+///
+/// A pure-reduction contract is one where ALL iterators are reduction
+/// iterators. In this case:
+/// - LHS and RHS have identical shapes (all iterators appear in both)
+/// - The result is a scalar (or lower-rank if partial reduction, but typically
+/// scalar)
+/// - The operation is semantically: result = acc + sum(lhs * rhs)
+///
+/// This pattern converts the contract to an element-wise multiply followed by
+/// a multi-dimensional reduction, which can then be further lowered by the
+/// existing vector.multi_reduction lowering patterns.
+///
+/// Example:
+/// ```mlir
+/// // Before (all reduction iterators):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(k0, k1) -> (k0, k1)>,
+///         affine_map<(k0, k1) -> (k0, k1)>,
+///         affine_map<(k0, k1) -> ()>
+///     ],
+///     iterator_types = ["reduction", "reduction"]
+/// } %lhs, %rhs, %acc : vector<4x8xf32>, vector<4x8xf32> into f32
+///
+/// // After:
+/// %prod = arith.mulf %lhs, %rhs : vector<4x8xf32>
+/// %result = vector.multi_reduction <add>, %prod, %acc [0, 1]
+///     : vector<4x8xf32> to f32
+/// ```
+struct PureReductionContractToMultiReduction
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    // Check that ALL iterators are reduction iterators.
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.empty())
+      return rewriter.notifyMatchFailure(contractOp, "no iterators");
+
+    for (Attribute iterType : iteratorTypes) {
+      if (!isReductionIterator(iterType))
+        return rewriter.notifyMatchFailure(contractOp,
+                                           "not all iterators are reduction");
+    }
+
+    // For a pure-reduction contract, LHS and RHS must have the same shape.
+    // This is guaranteed by the contract semantics when all iterators are
+    // reduction iterators (each reduction iterator appears in both LHS and RHS
+    // maps at the same position).
+    Value lhs = contractOp.getLhs();
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    auto lhsType = cast<VectorType>(lhs.getType());
+    auto rhsType = cast<VectorType>(rhs.getType());
+
+    if (lhsType != rhsType)
+      return rewriter.notifyMatchFailure(
+          contractOp, "LHS and RHS types don't match (unexpected for pure "
+                      "reduction contract)");
+
+    // Verify that the indexing maps are identity-like for LHS and RHS.
+    // For a valid pure-reduction contract:
+    // - LHS map: (d0, d1, ..., dn) -> (d0, d1, ..., dn)
+    // - RHS map: (d0, d1, ..., dn) -> (d0, d1, ..., dn)
+    // - ACC map: (d0, d1, ..., dn) -> ()
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    AffineMap lhsMap = maps[0];
+    AffineMap rhsMap = maps[1];
+    AffineMap accMap = maps[2];
+
+    // LHS and RHS maps should project to the same dimensions.
+    // We need to verify the maps are "compatible" for element-wise multiply.
+    // The simplest case is when both are permutation maps that result in
+    // element-wise alignment.
+    if (!lhsMap.isProjectedPermutation() || !rhsMap.isProjectedPermutation())
+      return rewriter.notifyMatchFailure(
+          contractOp, "LHS or RHS map is not a projected permutation");
+
+    // For now, require that LHS and RHS maps are identical.
+    // This means the element-wise multiply is directly applicable.
+    // TODO: Handle permuted cases by inserting a transpose.
+    if (lhsMap != rhsMap)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "LHS and RHS maps differ (would need transpose, not yet supported)");
+
+    // Verify ACC map produces a scalar (all dims reduced).
+    if (accMap.getNumResults() != 0)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "ACC map has results (partial reduction not yet supported)");
+
+    // Check the combining kind is the standard multiply-add.
+    // vector.contract defaults to MulF/AddF for floating point.
+    auto kind = contractOp.getKind();
+    if (kind != vector::CombiningKind::ADD)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "only ADD combining kind supported");
+
+    Location loc = contractOp.getLoc();
+
+    // Handle masking.
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    // Create element-wise multiply.
+    // For integer types, use arith.muli; for float, use arith.mulf.
+    Value prod;
+    Type elementType = lhsType.getElementType();
+    if (isa<FloatType>(elementType)) {
+      prod = arith::MulFOp::create(rewriter, loc, lhs, rhs);
+    } else if (isa<IntegerType>(elementType)) {
+      prod = arith::MulIOp::create(rewriter, loc, lhs, rhs);
+    } else {
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "unsupported element type");
+    }
+
+    // Create multi_reduction over all dimensions.
+    // The reduction dims are [0, 1, 2, ..., rank-1].
+    SmallVector<int64_t> reductionDims;
+    for (int64_t i = 0; i < lhsType.getRank(); ++i)
+      reductionDims.push_back(i);
+
+    // Create the multi_reduction.
+    Value result;
+    if (mask) {
+      // For masked operations, we need to apply the mask to the multiply,
+      // then reduce. The mask has the shape of the iteration space.
+      // Since all dims are reduction, the mask shape equals the operand shape.
+      //
+      // Masked reduction: only include elements where mask is true.
+      // We can implement this by:
+      // 1. Select between prod and neutral element (0 for add) based on mask
+      // 2. Reduce the result
+      Type prodType = prod.getType();
+      Value zero;
+      if (isa<FloatType>(elementType)) {
+        zero = arith::ConstantOp::create(rewriter, loc, prodType,
+                                         rewriter.getZeroAttr(prodType));
+      } else {
+        zero = arith::ConstantOp::create(rewriter, loc, prodType,
+                                         rewriter.getZeroAttr(prodType));
+      }
+      Value maskedProd =
+          arith::SelectOp::create(rewriter, loc, mask, prod, zero);
+
+      SmallVector<bool> reductionMask(lhsType.getRank(), true);
+      result = vector::MultiDimReductionOp::create(rewriter, loc, maskedProd,
+                                                   acc, reductionMask,
+                                                   vector::CombiningKind::ADD);
+    } else {
+      SmallVector<bool> reductionMask(lhsType.getRank(), true);
+      result = vector::MultiDimReductionOp::create(
+          rewriter, loc, prod, acc, reductionMask, vector::CombiningKind::ADD);
+    }
+
+    return result;
+  }
+};
+
 } // namespace
 
 void mlir::vector::populateVectorContractLoweringPatterns(
@@ -1227,6 +1831,15 @@ void mlir::vector::populateVectorContractLoweringPatterns(
     patterns.add<OuterProductOpLowering>(patterns.getContext(), benefit);
   patterns.add<ContractionOpLowering, ContractionOpToOuterProductOpLowering>(
       vectorContractLoweringOption, patterns.getContext(), benefit);
+}
+
+void mlir::vector::populateVectorUnrollContract(RewritePatternSet &patterns,
+                                                PatternBenefit benefit) {
+  patterns.add<UnrollContractAlongBatchDim>(patterns.getContext(), benefit);
+  patterns.add<UnrollContractAlongLhsFreeDim>(patterns.getContext(), benefit);
+  patterns.add<UnrollContractAlongRhsFreeDim>(patterns.getContext(), benefit);
+  patterns.add<PureReductionContractToMultiReduction>(patterns.getContext(),
+                                                      benefit);
 }
 
 void mlir::vector::populateVectorOuterProductLoweringPatterns(
