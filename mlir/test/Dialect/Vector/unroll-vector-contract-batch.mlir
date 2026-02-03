@@ -3,8 +3,13 @@
 // RUN:   -transform-interpreter=entry-point=unroll_contract | FileCheck %s
 
 //===----------------------------------------------------------------------===//
-// Test UnrollContractAlongBatchDim
+// Test UnrollContractAlongBatchDim + UnrollContractAlongLhsFreeDim
 //===----------------------------------------------------------------------===//
+
+// This test verifies that a batched matmul is fully unrolled:
+// 1. First, UnrollContractAlongBatchDim unrolls along the batch dimension (b=2)
+// 2. Then, UnrollContractAlongLhsFreeDim unrolls along the free LHS dimension (m=4)
+// The final contracts have iterator_types = ["parallel", "reduction"]
 
 // CHECK-LABEL: func @unroll_contract_batch_matmul
 // CHECK-SAME: %[[A:.+]]: vector<2x4x3xf32>,
@@ -15,24 +20,39 @@ func.func @unroll_contract_batch_matmul(
     %B: vector<2x3x5xf32>,
     %C: vector<2x4x5xf32>) -> vector<2x4x5xf32> {
 
-  // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0] : vector<4x3xf32> from vector<2x4x3xf32>
-  // CHECK-DAG: %[[A1:.+]] = vector.extract %[[A]][1] : vector<4x3xf32> from vector<2x4x3xf32>
+  // After batch unrolling, B is extracted per batch.
+  // After LHS free dim unrolling, B slices are reused across m iterations.
   // CHECK-DAG: %[[B0:.+]] = vector.extract %[[B]][0] : vector<3x5xf32> from vector<2x3x5xf32>
   // CHECK-DAG: %[[B1:.+]] = vector.extract %[[B]][1] : vector<3x5xf32> from vector<2x3x5xf32>
-  // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0] : vector<4x5xf32> from vector<2x4x5xf32>
-  // CHECK-DAG: %[[C1:.+]] = vector.extract %[[C]][1] : vector<4x5xf32> from vector<2x4x5xf32>
 
-  // CHECK: %[[R0:.+]] = vector.contract
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "reduction"]
-  // CHECK-SAME: %[[A0]], %[[B0]], %[[C0]]
-  // CHECK-SAME: : vector<4x3xf32>, vector<3x5xf32> into vector<4x5xf32>
+  // Extracts for batch 0, m=0,1,2,3
+  // CHECK-DAG: %[[A00:.+]] = vector.extract %[[A]][0, 0] : vector<3xf32> from vector<2x4x3xf32>
+  // CHECK-DAG: %[[C00:.+]] = vector.extract %[[C]][0, 0] : vector<5xf32> from vector<2x4x5xf32>
+  // CHECK-DAG: %[[A01:.+]] = vector.extract %[[A]][0, 1] : vector<3xf32> from vector<2x4x3xf32>
+  // CHECK-DAG: %[[C01:.+]] = vector.extract %[[C]][0, 1] : vector<5xf32> from vector<2x4x5xf32>
+  // CHECK-DAG: %[[A02:.+]] = vector.extract %[[A]][0, 2] : vector<3xf32> from vector<2x4x3xf32>
+  // CHECK-DAG: %[[C02:.+]] = vector.extract %[[C]][0, 2] : vector<5xf32> from vector<2x4x5xf32>
+  // CHECK-DAG: %[[A03:.+]] = vector.extract %[[A]][0, 3] : vector<3xf32> from vector<2x4x3xf32>
+  // CHECK-DAG: %[[C03:.+]] = vector.extract %[[C]][0, 3] : vector<5xf32> from vector<2x4x5xf32>
 
-  // CHECK: %[[R1:.+]] = vector.contract
-  // CHECK-SAME: %[[A1]], %[[B1]], %[[C1]]
-  // CHECK-SAME: : vector<4x3xf32>, vector<3x5xf32> into vector<4x5xf32>
+  // Final contracts: vector<3xf32>, vector<3x5xf32> -> vector<5xf32>
+  // These have iterator_types = ["parallel", "reduction"]
+  // CHECK: vector.contract
+  // CHECK-SAME: iterator_types = ["parallel", "reduction"]
+  // CHECK-SAME: %[[A00]], %[[B0]], %[[C00]]
+  // CHECK-SAME: : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
 
-  // CHECK: %[[INSERT0:.+]] = vector.insert %[[R0]], %{{.*}} [0] : vector<4x5xf32> into vector<2x4x5xf32>
-  // CHECK: %[[INSERT1:.+]] = vector.insert %[[R1]], %[[INSERT0]] [1] : vector<4x5xf32> into vector<2x4x5xf32>
+  // CHECK: vector.contract
+  // CHECK-SAME: iterator_types = ["parallel", "reduction"]
+  // CHECK-SAME: %[[A01]], %[[B0]], %[[C01]]
+
+  // CHECK: vector.contract
+  // CHECK-SAME: iterator_types = ["parallel", "reduction"]
+  // CHECK-SAME: %[[A02]], %[[B0]], %[[C02]]
+
+  // CHECK: vector.contract
+  // CHECK-SAME: iterator_types = ["parallel", "reduction"]
+  // CHECK-SAME: %[[A03]], %[[B0]], %[[C03]]
 
   %result = vector.contract {
       indexing_maps = [
@@ -43,22 +63,40 @@ func.func @unroll_contract_batch_matmul(
       iterator_types = ["parallel", "parallel", "parallel", "reduction"]
   } %A, %B, %C : vector<2x4x3xf32>, vector<2x3x5xf32> into vector<2x4x5xf32>
 
-  // CHECK: return %[[INSERT1]]
   return %result : vector<2x4x5xf32>
 }
 
 // -----
 
-// Negative test: no batch dimension (standard matmul should not match)
-// CHECK-LABEL: func @unroll_contract_no_batch
-func.func @unroll_contract_no_batch(
+// Test UnrollContractAlongLhsFreeDim on standard matmul (no batch dimension).
+// The pattern unrolls along the free LHS dimension 'm' (size 4).
+// Note: This was previously a "negative test" for batch unrolling, but now
+// UnrollContractAlongLhsFreeDim matches and transforms it.
+
+// CHECK-LABEL: func @unroll_contract_lhs_free_dim
+// CHECK-SAME: %[[A:.+]]: vector<4x3xf32>,
+// CHECK-SAME: %[[B:.+]]: vector<3x5xf32>,
+// CHECK-SAME: %[[C:.+]]: vector<4x5xf32>
+func.func @unroll_contract_lhs_free_dim(
     %A: vector<4x3xf32>,
     %B: vector<3x5xf32>,
     %C: vector<4x5xf32>) -> vector<4x5xf32> {
 
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "reduction"]
-  // CHECK-NOT: vector.extract
+  // B is reused (not extracted) since 'm' doesn't appear in B's indexing map.
+  // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0] : vector<3xf32> from vector<4x3xf32>
+  // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0] : vector<5xf32> from vector<4x5xf32>
+  // CHECK-DAG: %[[A1:.+]] = vector.extract %[[A]][1] : vector<3xf32> from vector<4x3xf32>
+  // CHECK-DAG: %[[C1:.+]] = vector.extract %[[C]][1] : vector<5xf32> from vector<4x5xf32>
+  // CHECK-DAG: %[[A2:.+]] = vector.extract %[[A]][2] : vector<3xf32> from vector<4x3xf32>
+  // CHECK-DAG: %[[C2:.+]] = vector.extract %[[C]][2] : vector<5xf32> from vector<4x5xf32>
+  // CHECK-DAG: %[[A3:.+]] = vector.extract %[[A]][3] : vector<3xf32> from vector<4x3xf32>
+  // CHECK-DAG: %[[C3:.+]] = vector.extract %[[C]][3] : vector<5xf32> from vector<4x5xf32>
+
+  // Contracts with B reused (not sliced):
+  // CHECK: vector.contract {{.*}} %[[A0]], %[[B]], %[[C0]] : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
+  // CHECK: vector.contract {{.*}} %[[A1]], %[[B]], %[[C1]] : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
+  // CHECK: vector.contract {{.*}} %[[A2]], %[[B]], %[[C2]] : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
+  // CHECK: vector.contract {{.*}} %[[A3]], %[[B]], %[[C3]] : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
 
   %result = vector.contract {
       indexing_maps = [
@@ -74,19 +112,40 @@ func.func @unroll_contract_no_batch(
 
 // -----
 
-// Negative test: batch dim not at outermost position
-// CHECK-LABEL: func @unroll_contract_batch_not_outermost
-func.func @unroll_contract_batch_not_outermost(
+// Test: Batch dim not at outermost position, but LHS free dim IS outermost.
+// UnrollContractAlongBatchDim does NOT match (batch 'b' is at position 1).
+// UnrollContractAlongLhsFreeDim DOES match ('m' is at position 0 in LHS/ACC,
+// and 'm' does not appear in RHS).
+
+// CHECK-LABEL: func @unroll_contract_lhs_free_not_batch
+// CHECK-SAME: %[[A:.+]]: vector<4x2x3xf32>,
+// CHECK-SAME: %[[B:.+]]: vector<3x2x5xf32>,
+// CHECK-SAME: %[[C:.+]]: vector<4x2x5xf32>
+func.func @unroll_contract_lhs_free_not_batch(
     %A: vector<4x2x3xf32>,
     %B: vector<3x2x5xf32>,
     %C: vector<4x2x5xf32>) -> vector<4x2x5xf32> {
 
-  // Batch dim 'b' is at position 1 in lhs (m, b, k), not outermost.
-  // Pattern should not match.
+  // 'm' is unrolled (size 4). B is reused since 'm' doesn't appear in its map.
+  // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0] : vector<2x3xf32> from vector<4x2x3xf32>
+  // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0] : vector<2x5xf32> from vector<4x2x5xf32>
+  // CHECK-DAG: %[[A1:.+]] = vector.extract %[[A]][1] : vector<2x3xf32> from vector<4x2x3xf32>
+  // CHECK-DAG: %[[C1:.+]] = vector.extract %[[C]][1] : vector<2x5xf32> from vector<4x2x5xf32>
+  // CHECK-DAG: %[[A2:.+]] = vector.extract %[[A]][2] : vector<2x3xf32> from vector<4x2x3xf32>
+  // CHECK-DAG: %[[C2:.+]] = vector.extract %[[C]][2] : vector<2x5xf32> from vector<4x2x5xf32>
+  // CHECK-DAG: %[[A3:.+]] = vector.extract %[[A]][3] : vector<2x3xf32> from vector<4x2x3xf32>
+  // CHECK-DAG: %[[C3:.+]] = vector.extract %[[C]][3] : vector<2x5xf32> from vector<4x2x5xf32>
 
+  // The resulting contracts still have the batch dim 'b' (now at iterator position 0
+  // after 'm' was removed), but it's not at outermost in the operands.
   // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "reduction"]
-  // CHECK-NOT: vector.extract
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "reduction"]
+  // CHECK-SAME: %[[A0]], %[[B]], %[[C0]]
+  // CHECK-SAME: : vector<2x3xf32>, vector<3x2x5xf32> into vector<2x5xf32>
+
+  // CHECK: vector.contract {{.*}} %[[A1]], %[[B]], %[[C1]]
+  // CHECK: vector.contract {{.*}} %[[A2]], %[[B]], %[[C2]]
+  // CHECK: vector.contract {{.*}} %[[A3]], %[[B]], %[[C3]]
 
   %result = vector.contract {
       indexing_maps = [
@@ -102,6 +161,8 @@ func.func @unroll_contract_batch_not_outermost(
 
 // -----
 
+// Test masked batch matmul with full unrolling (batch + LHS free dim).
+
 // CHECK-LABEL: func @unroll_contract_batch_masked
 // CHECK-SAME: %[[A:.+]]: vector<2x4x3xf32>,
 // CHECK-SAME: %[[B:.+]]: vector<2x3x5xf32>,
@@ -113,14 +174,19 @@ func.func @unroll_contract_batch_masked(
     %C: vector<2x4x5xf32>,
     %mask: vector<2x4x5x3xi1>) -> vector<2x4x5xf32> {
 
-  // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0]
-  // CHECK-DAG: %[[B0:.+]] = vector.extract %[[B]][0]
-  // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0]
-  // CHECK-DAG: %[[MASK0:.+]] = vector.extract %[[MASK]][0]
+  // B extracted per batch (batch unrolling)
+  // CHECK-DAG: %[[B0:.+]] = vector.extract %[[B]][0] : vector<3x5xf32> from vector<2x3x5xf32>
 
-  // CHECK: vector.mask %[[MASK0]] {
-  // CHECK:   vector.contract {{.*}} %[[A0]], %[[B0]], %[[C0]]
-  // CHECK: }
+  // Extracts for batch 0, with mask slices (LHS free dim unrolling)
+  // CHECK-DAG: %[[A00:.+]] = vector.extract %[[A]][0, 0] : vector<3xf32> from vector<2x4x3xf32>
+  // CHECK-DAG: %[[C00:.+]] = vector.extract %[[C]][0, 0] : vector<5xf32> from vector<2x4x5xf32>
+  // CHECK-DAG: %[[MASK00:.+]] = vector.extract %[[MASK]][0, 0] : vector<5x3xi1> from vector<2x4x5x3xi1>
+
+  // Masked contracts with B0 reused
+  // CHECK: vector.mask %[[MASK00]] {
+  // CHECK:   vector.contract {{.*}} %[[A00]], %[[B0]], %[[C00]]
+  // CHECK:   : vector<3xf32>, vector<3x5xf32> into vector<5xf32>
+  // CHECK: } : vector<5x3xi1> -> vector<5xf32>
 
   %result = vector.mask %mask {
     vector.contract {
