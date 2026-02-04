@@ -85,18 +85,17 @@ func.func @unroll_contract_lhs_free_matvec(
 
   // CHECK-NOT: vector.extract %[[B]]
 
-  // CHECK: %[[R0:.+]] = vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A0]], %[[B]], %[[C0]]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // CHECK: %[[A0M:.+]] = arith.mulf %[[A0]], %[[B]] : vector<8xf32>
+  // CHECK: %[[R0:.+]] = vector.multi_reduction <add>, %[[A0M]], %[[C0]] [0]
+  // CHECK-SAME: : vector<8xf32> to f32
 
-  // CHECK: %[[R1:.+]] = vector.contract
-  // CHECK-SAME: %[[A1]], %[[B]], %[[C1]]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // CHECK: %[[A1M:.+]] = arith.mulf %[[A1]], %[[B]] : vector<8xf32>
+  // CHECK: %[[R1:.+]] = vector.multi_reduction <add>, %[[A1M]], %[[C1]] [0]
+  // CHECK-SAME: : vector<8xf32> to f32
 
-  // CHECK: %[[R2:.+]] = vector.contract
-  // CHECK-SAME: %[[A2]], %[[B]], %[[C2]]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // CHECK: %[[A2M:.+]] = arith.mulf %[[A2]], %[[B]] : vector<8xf32>
+  // CHECK: %[[R2:.+]] = vector.multi_reduction <add>, %[[A2M]], %[[C2]] [0]
+  // CHECK-SAME: : vector<8xf32> to f32
 
   // CHECK: vector.insert %[[R0]], {{.*}}[0]
   // CHECK: vector.insert %[[R1]], {{.*}}[1]
@@ -276,14 +275,13 @@ func.func @unroll_contract_lhs_free_to_1d(
   // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0] : f32 from vector<2xf32>
   // CHECK-DAG: %[[C1:.+]] = vector.extract %[[C]][1] : f32 from vector<2xf32>
 
-  // CHECK: %[[R0:.+]] = vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A0]], %[[B]], %[[C0]]
-  // CHECK-SAME: : vector<4xf32>, vector<4xf32> into f32
+  // CHECK: %[[A0M:.+]] = arith.mulf %[[A0]], %[[B]] : vector<4xf32>
+  // CHECK: %[[R0:.+]] = vector.multi_reduction <add>, %[[A0M]], %[[C0]] [0]
+  // CHECK-SAME: : vector<4xf32> to f32
 
-  // CHECK: %[[R1:.+]] = vector.contract
-  // CHECK-SAME: %[[A1]], %[[B]], %[[C1]]
-  // CHECK-SAME: : vector<4xf32>, vector<4xf32> into f32
+  // CHECK: %[[A1M:.+]] = arith.mulf %[[A1]], %[[B]] : vector<4xf32>
+  // CHECK: %[[R1:.+]] = vector.multi_reduction <add>, %[[A1M]], %[[C1]] [0]
+  // CHECK-SAME: : vector<4xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [

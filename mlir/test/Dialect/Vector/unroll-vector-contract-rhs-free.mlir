@@ -40,9 +40,10 @@ func.func @unroll_contract_rhs_free_basic(
   // CHECK-DAG: vector.extract %[[C]][0, 1] : f32 from vector<6x4xf32>
 
   // Final contracts are dot products: vector<8xf32> dot vector<8xf32> -> f32
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // Now lowered to multi_reduction
+  // CHECK: arith.mulf
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [
@@ -79,18 +80,18 @@ func.func @unroll_contract_rhs_free_vecmat(
   // CHECK-DAG: %[[C2:.+]] = vector.extract %[[C]][2] : f32 from vector<3xf32>
 
   // Final contracts are dot products
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A]], %[[B0]], %[[C0]]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // Now lowered to multi_reduction
+  // CHECK: arith.mulf %[[A]], %[[B0]] : vector<8xf32>
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A]], %[[B1]], %[[C1]]
+  // CHECK: arith.mulf %[[A]], %[[B1]] : vector<8xf32>
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A]], %[[B2]], %[[C2]]
+  // CHECK: arith.mulf %[[A]], %[[B2]] : vector<8xf32>
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [
@@ -127,9 +128,9 @@ func.func @unroll_contract_rhs_free_small(
   // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0] : vector<8xf32> from vector<4x8xf32>
   // CHECK-DAG: %[[A1:.+]] = vector.extract %[[A]][1] : vector<8xf32> from vector<4x8xf32>
 
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // CHECK: arith.mulf
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [
@@ -154,9 +155,10 @@ func.func @unroll_contract_rhs_free_not_outermost_acc(
 
   // 'n' is at position 0 in RHS (n, k), but at position 1 in ACC (m, n).
   // Pattern should NOT match because n is not outermost in ACC.
-  // The free LHS pattern might match for m instead.
+  // The free LHS pattern might match for m instead, leading to multi_reduction.
 
-  // CHECK: vector.contract
+  // CHECK: arith.mulf
+  // CHECK: vector.multi_reduction <add>
 
   %result = vector.contract {
       indexing_maps = [
@@ -199,9 +201,11 @@ func.func @unroll_contract_rhs_free_masked(
   // CHECK-DAG: vector.extract %[[MASK]][0, 0]
 
   // Final masked dot products
-  // CHECK: vector.mask
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
+  // The mask is applied via arith.select on the product, then reduced
+  // CHECK: arith.mulf
+  // CHECK: arith.select
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
   %result = vector.mask %mask {
     vector.contract {
@@ -238,14 +242,13 @@ func.func @unroll_contract_rhs_free_to_dot(
   // CHECK-DAG: %[[C0:.+]] = vector.extract %[[C]][0] : f32 from vector<2xf32>
   // CHECK-DAG: %[[C1:.+]] = vector.extract %[[C]][1] : f32 from vector<2xf32>
 
-  // CHECK: %[[R0:.+]] = vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A]], %[[B0]], %[[C0]]
-  // CHECK-SAME: : vector<4xf32>, vector<4xf32> into f32
+  // CHECK: %[[A0M:.+]] = arith.mulf %[[A]], %[[B0]] : vector<4xf32>
+  // CHECK: %[[R0:.+]] = vector.multi_reduction <add>, %[[A0M]], %[[C0]] [0]
+  // CHECK-SAME: : vector<4xf32> to f32
 
-  // CHECK: %[[R1:.+]] = vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: %[[A]], %[[B1]], %[[C1]]
+  // CHECK: %[[A1M:.+]] = arith.mulf %[[A]], %[[B1]] : vector<4xf32>
+  // CHECK: %[[R1:.+]] = vector.multi_reduction <add>, %[[A1M]], %[[C1]] [0]
+  // CHECK-SAME: : vector<4xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [
@@ -278,9 +281,9 @@ func.func @unroll_contract_rhs_free_size_one(
 
   // CHECK-DAG: %[[A0:.+]] = vector.extract %[[A]][0] : vector<8xf32> from vector<4x8xf32>
 
-  // CHECK: vector.contract
-  // CHECK-SAME: iterator_types = ["reduction"]
-  // CHECK-SAME: : vector<8xf32>, vector<8xf32> into f32
+  // CHECK: arith.mulf
+  // CHECK: vector.multi_reduction <add>
+  // CHECK-SAME: [0] : vector<8xf32> to f32
 
   %result = vector.contract {
       indexing_maps = [

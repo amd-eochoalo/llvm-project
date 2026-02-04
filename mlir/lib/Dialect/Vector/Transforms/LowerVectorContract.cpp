@@ -1290,6 +1290,13 @@ struct UnrollContractAlongBatchDim
                                          "need at least 2 iterators");
 
     SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (maps[0].getNumResults() == 0 || maps[1].getNumResults() == 0 ||
+        maps[2].getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
+
     int64_t lhsIter = maps[0].getDimPosition(0);
     int64_t rhsIter = maps[1].getDimPosition(0);
     int64_t accIter = maps[2].getDimPosition(0);
@@ -1420,6 +1427,12 @@ struct UnrollContractAlongLhsFreeDim
     AffineMap lhsMap = maps[0];
     AffineMap rhsMap = maps[1];
     AffineMap accMap = maps[2];
+
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (lhsMap.getNumResults() == 0 || rhsMap.getNumResults() == 0 ||
+        accMap.getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
 
     int64_t lhsIter = lhsMap.getDimPosition(0);
     int64_t accIter = accMap.getDimPosition(0);
@@ -1553,6 +1566,12 @@ struct UnrollContractAlongRhsFreeDim
     AffineMap rhsMap = maps[1];
     AffineMap accMap = maps[2];
 
+    // Check if maps have results at position 0 (not a pure reduction)
+    if (lhsMap.getNumResults() == 0 || rhsMap.getNumResults() == 0 ||
+        accMap.getNumResults() == 0)
+      return rewriter.notifyMatchFailure(
+          contractOp, "one or more maps have no results (pure reduction)");
+
     int64_t rhsIter = rhsMap.getDimPosition(0);
     int64_t accIter = accMap.getDimPosition(0);
 
@@ -1630,6 +1649,178 @@ struct UnrollContractAlongRhsFreeDim
   }
 };
 
+//===----------------------------------------------------------------------===//
+// PureReductionContractToMultiReduction
+//===----------------------------------------------------------------------===//
+
+/// Lowers a pure-reduction vector.contract to arith.mulf +
+/// vector.multi_reduction.
+///
+/// A pure-reduction contract is one where ALL iterators are reduction
+/// iterators. In this case:
+/// - LHS and RHS have identical shapes (all iterators appear in both)
+/// - The result is a scalar (or lower-rank if partial reduction, but typically
+/// scalar)
+/// - The operation is semantically: result = acc + sum(lhs * rhs)
+///
+/// This pattern converts the contract to an element-wise multiply followed by
+/// a multi-dimensional reduction, which can then be further lowered by the
+/// existing vector.multi_reduction lowering patterns.
+///
+/// Example:
+/// ```mlir
+/// // Before (all reduction iterators):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(k0, k1) -> (k0, k1)>,
+///         affine_map<(k0, k1) -> (k0, k1)>,
+///         affine_map<(k0, k1) -> ()>
+///     ],
+///     iterator_types = ["reduction", "reduction"]
+/// } %lhs, %rhs, %acc : vector<4x8xf32>, vector<4x8xf32> into f32
+///
+/// // After:
+/// %prod = arith.mulf %lhs, %rhs : vector<4x8xf32>
+/// %result = vector.multi_reduction <add>, %prod, %acc [0, 1]
+///     : vector<4x8xf32> to f32
+/// ```
+struct PureReductionContractToMultiReduction
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    // Check that ALL iterators are reduction iterators.
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.empty())
+      return rewriter.notifyMatchFailure(contractOp, "no iterators");
+
+    for (Attribute iterType : iteratorTypes) {
+      if (!isReductionIterator(iterType))
+        return rewriter.notifyMatchFailure(contractOp,
+                                           "not all iterators are reduction");
+    }
+
+    // For a pure-reduction contract, LHS and RHS must have the same shape.
+    // This is guaranteed by the contract semantics when all iterators are
+    // reduction iterators (each reduction iterator appears in both LHS and RHS
+    // maps at the same position).
+    Value lhs = contractOp.getLhs();
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    auto lhsType = cast<VectorType>(lhs.getType());
+    auto rhsType = cast<VectorType>(rhs.getType());
+
+    if (lhsType != rhsType)
+      return rewriter.notifyMatchFailure(
+          contractOp, "LHS and RHS types don't match (unexpected for pure "
+                      "reduction contract)");
+
+    // Verify that the indexing maps are identity-like for LHS and RHS.
+    // For a valid pure-reduction contract:
+    // - LHS map: (d0, d1, ..., dn) -> (d0, d1, ..., dn)
+    // - RHS map: (d0, d1, ..., dn) -> (d0, d1, ..., dn)
+    // - ACC map: (d0, d1, ..., dn) -> ()
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    AffineMap lhsMap = maps[0];
+    AffineMap rhsMap = maps[1];
+    AffineMap accMap = maps[2];
+
+    // LHS and RHS maps should project to the same dimensions.
+    // We need to verify the maps are "compatible" for element-wise multiply.
+    // The simplest case is when both are permutation maps that result in
+    // element-wise alignment.
+    if (!lhsMap.isProjectedPermutation() || !rhsMap.isProjectedPermutation())
+      return rewriter.notifyMatchFailure(
+          contractOp, "LHS or RHS map is not a projected permutation");
+
+    // For now, require that LHS and RHS maps are identical.
+    // This means the element-wise multiply is directly applicable.
+    // TODO: Handle permuted cases by inserting a transpose.
+    if (lhsMap != rhsMap)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "LHS and RHS maps differ (would need transpose, not yet supported)");
+
+    // Verify ACC map produces a scalar (all dims reduced).
+    if (accMap.getNumResults() != 0)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "ACC map has results (partial reduction not yet supported)");
+
+    // Check the combining kind is the standard multiply-add.
+    // vector.contract defaults to MulF/AddF for floating point.
+    auto kind = contractOp.getKind();
+    if (kind != vector::CombiningKind::ADD)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "only ADD combining kind supported");
+
+    Location loc = contractOp.getLoc();
+
+    // Handle masking.
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    // Create element-wise multiply.
+    // For integer types, use arith.muli; for float, use arith.mulf.
+    Value prod;
+    Type elementType = lhsType.getElementType();
+    if (isa<FloatType>(elementType)) {
+      prod = arith::MulFOp::create(rewriter, loc, lhs, rhs);
+    } else if (isa<IntegerType>(elementType)) {
+      prod = arith::MulIOp::create(rewriter, loc, lhs, rhs);
+    } else {
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "unsupported element type");
+    }
+
+    // Create multi_reduction over all dimensions.
+    // The reduction dims are [0, 1, 2, ..., rank-1].
+    SmallVector<int64_t> reductionDims;
+    for (int64_t i = 0; i < lhsType.getRank(); ++i)
+      reductionDims.push_back(i);
+
+    // Create the multi_reduction.
+    Value result;
+    if (mask) {
+      // For masked operations, we need to apply the mask to the multiply,
+      // then reduce. The mask has the shape of the iteration space.
+      // Since all dims are reduction, the mask shape equals the operand shape.
+      //
+      // Masked reduction: only include elements where mask is true.
+      // We can implement this by:
+      // 1. Select between prod and neutral element (0 for add) based on mask
+      // 2. Reduce the result
+      Type prodType = prod.getType();
+      Value zero;
+      if (isa<FloatType>(elementType)) {
+        zero = arith::ConstantOp::create(rewriter, loc, prodType,
+                                         rewriter.getZeroAttr(prodType));
+      } else {
+        zero = arith::ConstantOp::create(rewriter, loc, prodType,
+                                         rewriter.getZeroAttr(prodType));
+      }
+      Value maskedProd =
+          arith::SelectOp::create(rewriter, loc, mask, prod, zero);
+
+      SmallVector<bool> reductionMask(lhsType.getRank(), true);
+      result = vector::MultiDimReductionOp::create(rewriter, loc, maskedProd,
+                                                   acc, reductionMask,
+                                                   vector::CombiningKind::ADD);
+    } else {
+      SmallVector<bool> reductionMask(lhsType.getRank(), true);
+      result = vector::MultiDimReductionOp::create(
+          rewriter, loc, prod, acc, reductionMask, vector::CombiningKind::ADD);
+    }
+
+    return result;
+  }
+};
+
 } // namespace
 
 void mlir::vector::populateVectorContractLoweringPatterns(
@@ -1647,6 +1838,8 @@ void mlir::vector::populateVectorUnrollContract(RewritePatternSet &patterns,
   patterns.add<UnrollContractAlongBatchDim>(patterns.getContext(), benefit);
   patterns.add<UnrollContractAlongLhsFreeDim>(patterns.getContext(), benefit);
   patterns.add<UnrollContractAlongRhsFreeDim>(patterns.getContext(), benefit);
+  patterns.add<PureReductionContractToMultiReduction>(patterns.getContext(),
+                                                      benefit);
 }
 
 void mlir::vector::populateVectorOuterProductLoweringPatterns(
