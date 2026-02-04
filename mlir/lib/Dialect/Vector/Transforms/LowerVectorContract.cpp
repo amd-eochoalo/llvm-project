@@ -1325,11 +1325,9 @@ struct UnrollContractAlongBatchDim
     for (AffineMap map : maps)
       newMaps.push_back(dropIteratorFromMap(map, batchIterIdx, ctx));
 
-    // Create new iterator types with the batch iterator removed.
     SmallVector<Attribute> newIterTypes =
         dropIteratorType(iteratorTypes, batchIterIdx);
 
-    // Extract slices and compute smaller contracts.
     SmallVector<Value> lhsSlices, rhsSlices, accSlices, maskSlices;
     for (int64_t i = 0; i < batchDimSize; ++i) {
       lhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, lhs, i));
@@ -1339,7 +1337,6 @@ struct UnrollContractAlongBatchDim
         maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
     }
 
-    // Create smaller contracts.
     SmallVector<Value> results;
     ArrayAttr newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
     ArrayAttr newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
@@ -1358,7 +1355,6 @@ struct UnrollContractAlongBatchDim
       }
     }
 
-    // Assemble results.
     auto resultType = cast<VectorType>(contractOp.getResultType());
     Value result = arith::ConstantOp::create(rewriter, loc, resultType,
                                              rewriter.getZeroAttr(resultType));
@@ -1415,16 +1411,11 @@ struct UnrollContractAlongLhsFreeDim
   matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
                             MaskingOpInterface maskOp,
                             PatternRewriter &rewriter) const override {
-    // Need at least 2 iterators to unroll one away.
     ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
     if (iteratorTypes.size() < 2)
       return rewriter.notifyMatchFailure(contractOp,
                                          "need at least 2 iterators");
 
-    // Check if position 0 in LHS and ACC maps refers to the same iterator,
-    // and that iterator does NOT appear in RHS.
-    // A free LHS dimension is a parallel iterator that appears at the outermost
-    // position in LHS and ACC, but NOT in RHS.
     SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
     AffineMap lhsMap = maps[0];
     AffineMap rhsMap = maps[1];
@@ -1433,20 +1424,17 @@ struct UnrollContractAlongLhsFreeDim
     int64_t lhsIter = lhsMap.getDimPosition(0);
     int64_t accIter = accMap.getDimPosition(0);
 
-    // LHS and ACC must have the same iterator at their outermost position.
     if (lhsIter != accIter)
       return rewriter.notifyMatchFailure(
           contractOp,
           "LHS and ACC have different iterators at outermost position");
 
-    // That iterator must NOT appear in RHS (key difference from batch).
     int64_t freeLhsIterIdx = lhsIter;
     if (getResultIndex(rhsMap, freeLhsIterIdx).has_value())
       return rewriter.notifyMatchFailure(
           contractOp,
           "outermost LHS iterator also appears in RHS (not a free LHS dim)");
 
-    // That iterator must be parallel.
     if (!isParallelIterator(iteratorTypes[freeLhsIterIdx]))
       return rewriter.notifyMatchFailure(
           contractOp,
@@ -1456,25 +1444,21 @@ struct UnrollContractAlongLhsFreeDim
 
     Location loc = contractOp.getLoc();
     Value lhs = contractOp.getLhs();
-    Value rhs = contractOp.getRhs(); // Will be reused, not extracted
+    Value rhs = contractOp.getRhs();
     Value acc = contractOp.getAcc();
 
-    // Handle masking.
     Value mask;
     if (maskOp)
       mask = maskOp.getMask();
 
-    // Create new indexing maps with the free LHS iterator removed.
     MLIRContext *ctx = rewriter.getContext();
     SmallVector<AffineMap> newMaps;
     for (AffineMap map : maps)
       newMaps.push_back(dropIteratorFromMap(map, freeLhsIterIdx, ctx));
 
-    // Create new iterator types with the free LHS iterator removed.
     SmallVector<Attribute> newIterTypes =
         dropIteratorType(iteratorTypes, freeLhsIterIdx);
 
-    // Extract slices from LHS and ACC. RHS is reused.
     SmallVector<Value> lhsSlices, accSlices, maskSlices;
     for (int64_t i = 0; i < freeLhsDimSize; ++i) {
       lhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, lhs, i));
@@ -1503,12 +1487,143 @@ struct UnrollContractAlongLhsFreeDim
       }
     }
 
-    // Assemble results.
     auto resultType = cast<VectorType>(contractOp.getResultType());
     Value result = arith::ConstantOp::create(rewriter, loc, resultType,
                                              rewriter.getZeroAttr(resultType));
 
     for (int64_t i = 0; i < freeLhsDimSize; ++i)
+      result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
+
+    return result;
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// UnrollContractAlongRhsFreeDim
+//===----------------------------------------------------------------------===//
+
+/// Unrolls vector.contract along a free RHS dimension.
+///
+/// A free RHS dimension is a parallel iterator that appears in the RHS
+/// and accumulator/result, but NOT in the LHS. This pattern extracts
+/// slices along the free dimension from RHS and ACC, while reusing LHS
+/// (which is broadcast semantically across this dimension).
+///
+/// Example:
+/// ```mlir
+/// // Before (free RHS dim 'n' at iterator position 0):
+/// %result = vector.contract {
+///     indexing_maps = [
+///         affine_map<(n, m, k) -> (m, k)>,  // LHS: 4x8 (no n)
+///         affine_map<(n, m, k) -> (n, k)>,  // RHS: 6x8
+///         affine_map<(n, m, k) -> (n, m)>   // ACC: 6x4
+///     ],
+///     iterator_types = ["parallel", "parallel", "reduction"]
+/// } %A, %B, %C : vector<4x8xf32>, vector<6x8xf32> into vector<6x4xf32>
+///
+/// // After:
+/// %b0 = vector.extract %B[0] : vector<8xf32> from vector<6x8xf32>
+/// %c0 = vector.extract %C[0] : vector<4xf32> from vector<6x4xf32>
+/// // Note: A is NOT extracted - reused for all iterations
+/// %r0 = vector.contract {
+///     indexing_maps = [
+///         affine_map<(m, k) -> (m, k)>,
+///         affine_map<(m, k) -> (k)>,
+///         affine_map<(m, k) -> (m)>
+///     ],
+///     iterator_types = ["parallel", "reduction"]
+/// } %A, %b0, %c0 : vector<4x8xf32>, vector<8xf32> into vector<4xf32>
+/// // ... repeat for n=1..5, then assemble results ...
+/// ```
+struct UnrollContractAlongRhsFreeDim
+    : public MaskableOpRewritePattern<vector::ContractionOp> {
+  using MaskableOpRewritePattern::MaskableOpRewritePattern;
+
+  FailureOr<Value>
+  matchAndRewriteMaskableOp(vector::ContractionOp contractOp,
+                            MaskingOpInterface maskOp,
+                            PatternRewriter &rewriter) const override {
+    ArrayAttr iteratorTypes = contractOp.getIteratorTypes();
+    if (iteratorTypes.size() < 2)
+      return rewriter.notifyMatchFailure(contractOp,
+                                         "need at least 2 iterators");
+
+    SmallVector<AffineMap> maps = contractOp.getIndexingMapsArray();
+    AffineMap lhsMap = maps[0];
+    AffineMap rhsMap = maps[1];
+    AffineMap accMap = maps[2];
+
+    int64_t rhsIter = rhsMap.getDimPosition(0);
+    int64_t accIter = accMap.getDimPosition(0);
+
+    if (rhsIter != accIter)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "RHS and ACC have different iterators at outermost position");
+
+    int64_t freeRhsIterIdx = rhsIter;
+    if (getResultIndex(lhsMap, freeRhsIterIdx).has_value())
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost RHS iterator also appears in LHS (not a free RHS dim)");
+
+    if (!isParallelIterator(iteratorTypes[freeRhsIterIdx]))
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "outermost RHS iterator is not parallel (not a free dimension)");
+
+    int64_t freeRhsDimSize = contractOp.getRhsType().getDimSize(0);
+
+    Location loc = contractOp.getLoc();
+    Value lhs = contractOp.getLhs(); // Will be reused, not extracted
+    Value rhs = contractOp.getRhs();
+    Value acc = contractOp.getAcc();
+
+    Value mask;
+    if (maskOp)
+      mask = maskOp.getMask();
+
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<AffineMap> newMaps;
+    for (AffineMap map : maps)
+      newMaps.push_back(dropIteratorFromMap(map, freeRhsIterIdx, ctx));
+
+    SmallVector<Attribute> newIterTypes =
+        dropIteratorType(iteratorTypes, freeRhsIterIdx);
+
+    SmallVector<Value> rhsSlices, accSlices, maskSlices;
+    for (int64_t i = 0; i < freeRhsDimSize; ++i) {
+      rhsSlices.push_back(vector::ExtractOp::create(rewriter, loc, rhs, i));
+      accSlices.push_back(vector::ExtractOp::create(rewriter, loc, acc, i));
+      if (mask)
+        maskSlices.push_back(vector::ExtractOp::create(rewriter, loc, mask, i));
+    }
+
+    // Create smaller contracts.
+    // Key: LHS is NOT sliced - it's reused for all iterations.
+    SmallVector<Value> results;
+    auto newMapsAttr = rewriter.getAffineMapArrayAttr(newMaps);
+    auto newIterTypesAttr = rewriter.getArrayAttr(newIterTypes);
+
+    for (int64_t i = 0; i < freeRhsDimSize; ++i) {
+      auto newContract = vector::ContractionOp::create(
+          rewriter, loc, lhs, rhsSlices[i], accSlices[i], newMapsAttr,
+          newIterTypesAttr, contractOp.getKind());
+
+      if (mask) {
+        Operation *maskedOp =
+            mlir::vector::maskOperation(rewriter, newContract, maskSlices[i]);
+        results.push_back(maskedOp->getResult(0));
+      } else {
+        results.push_back(newContract.getResult());
+      }
+    }
+
+    auto resultType = cast<VectorType>(contractOp.getResultType());
+    Value result = arith::ConstantOp::create(rewriter, loc, resultType,
+                                             rewriter.getZeroAttr(resultType));
+
+    for (int64_t i = 0; i < freeRhsDimSize; ++i)
       result = vector::InsertOp::create(rewriter, loc, results[i], result, i);
 
     return result;
@@ -1531,6 +1646,7 @@ void mlir::vector::populateVectorUnrollContract(RewritePatternSet &patterns,
                                                 PatternBenefit benefit) {
   patterns.add<UnrollContractAlongBatchDim>(patterns.getContext(), benefit);
   patterns.add<UnrollContractAlongLhsFreeDim>(patterns.getContext(), benefit);
+  patterns.add<UnrollContractAlongRhsFreeDim>(patterns.getContext(), benefit);
 }
 
 void mlir::vector::populateVectorOuterProductLoweringPatterns(
